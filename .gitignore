@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Settings
+.vscode
+*.ses
+
+# Data
+data/wav
+data/warblrb10k_public_wav
+runs/

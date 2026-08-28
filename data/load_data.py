@@ -8,17 +8,24 @@ from scipy.io import wavfile
 from scipy.signal import resample_poly
 
 
+DATASET_DIRS = ["warblrb10k_public", "ff1010bird", "BirdVox-DCASE-20k"]
+
+
 class WarblrbDataset(torch.utils.data.Dataset):
     def __init__(self, root_dir: str | Path = "data", sample_rate: int = 16000):
         self.root_dir = Path(root_dir)
-        self.wav_dir = self.root_dir / "wav"
         self.sample_rate = sample_rate  # resample everything to this rate
-        metadata = self.root_dir / "warblrb10k_public_wav" / "warblrb10k_public_metadata_2018.csv"
+        self.labels: list[tuple[Path, bool]] = []
+        for dataset_dir in DATASET_DIRS:
+            self._load_dataset(self.root_dir / dataset_dir)
+
+    def _load_dataset(self, dataset_dir: Path) -> None:
+        metadata = dataset_dir / "metadata.csv"
         with open(metadata, "r") as f:
-            self.labels: list[tuple[Path, bool]] = [
-                (self.wav_dir / f"{row['itemid']}.wav", bool(int(row["hasbird"])))
+            self.labels.extend(
+                (dataset_dir / f"{row['itemid']}.wav", bool(int(row["hasbird"])))
                 for row in DictReader(f)
-            ]
+            )
 
     def __len__(self) -> int:
         return len(self.labels)
@@ -27,7 +34,7 @@ class WarblrbDataset(torch.utils.data.Dataset):
         audio_path, label = self.labels[idx]
         sr, data = wavfile.read(audio_path)
         if sr != self.sample_rate:
-            # polyphase resample to the model's expected rate (Warblr is 44.1 kHz)
+            # polyphase resample to the model's expected rate (dev sets are 44.1 kHz)
             g = gcd(sr, self.sample_rate)
             data = resample_poly(data, self.sample_rate // g, sr // g)
         return torch.from_numpy(data.astype("float32")), label

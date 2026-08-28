@@ -11,7 +11,7 @@ from scipy.signal import resample_poly
 DATASET_DIRS = ["warblrb10k_public", "ff1010bird", "BirdVox-DCASE-20k"]
 
 
-class WarblrbDataset(torch.utils.data.Dataset):
+class TwitDataset(torch.utils.data.Dataset):
     def __init__(self, root_dir: str | Path = "data", sample_rate: int = 16000):
         self.root_dir = Path(root_dir)
         self.sample_rate = sample_rate  # resample everything to this rate

@@ -135,6 +135,53 @@ def _verify_onnx(onnx_path, example, torch_out):
     print(f"onnxruntime-vs-torch max abs diff: {diff:.3e}")
 
 
+class _CachedAudioDataset(Dataset):
+    """Reads the resampled on-disk cache (data/.cache/srN) directly.
+
+    The raw DCASE dev sets are ~25 GB and often absent locally, but the 16 kHz
+    resample cache built by load_data is enough for representative calibration.
+    Returns (raw-int16-as-float waveform, label) to match TwitDataset.__getitem__.
+    """
+
+    def __init__(self, cache_dir: str | Path):
+        self.paths = sorted(Path(cache_dir).rglob("*.wav"))
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        from scipy.io import wavfile
+
+        _, data = wavfile.read(self.paths[index])
+        return torch.from_numpy(data.astype("float32")), 0
+
+
+def _build_calibration_source(data_root: str | Path, sample_rate: int) -> Dataset:
+    """Representative audio for calibration.
+
+    Prefers the raw TwitDataset layout; falls back to the resampled on-disk cache
+    (data/.cache/srN) when the multi-GB raw datasets aren't present locally.
+    """
+    root = Path(data_root)
+    try:
+        from data.load_data import TwitDataset
+
+        return TwitDataset(root_dir=root, sample_rate=sample_rate)
+    except (FileNotFoundError, ImportError):
+        pass
+
+    cache_dir = root / ".cache" / f"sr{sample_rate}"
+    if cache_dir.is_dir():
+        source = _CachedAudioDataset(cache_dir)
+        if len(source):
+            print(f"calibrating from resample cache: {cache_dir} ({len(source)} clips)")
+            return source
+    raise ValueError(
+        f"no calibration audio found: neither raw datasets under {root} nor a "
+        f"resample cache at {cache_dir}"
+    )
+
+
 class _FixedWindowCalibrationDataset(Dataset):
     """Deterministic fixed windows spread across the training audio collection."""
 
@@ -189,12 +236,8 @@ def convert_to_espdl(
             "instructions in the ESP-DL documentation"
         ) from exc
 
-    from data.load_data import WarblrbDataset
-
     check_espdl_operator_support(onnx_path)
-    source = WarblrbDataset(root_dir=data_root, sample_rate=sample_rate)
-    if not len(source):
-        raise ValueError(f"no calibration audio found under {data_root}")
+    source = _build_calibration_source(data_root, sample_rate)
     calibration = _FixedWindowCalibrationDataset(
         source,
         clip_len=clip_len,
@@ -218,7 +261,7 @@ def convert_to_espdl(
         calib_dataloader=loader,
         calib_steps=actual_steps,
         input_shape=None,
-        inputs=test_input,
+        inputs=[test_input],
         target="esp32s3",
         num_of_bits=bits,
         collate_fn=lambda batch: batch.to(device),

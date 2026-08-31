@@ -113,6 +113,65 @@ class LinearHead(nn.Module):
         pooled = self.tau * (torch.logsumexp(x / self.tau, dim=-1) - denom)  # logmeanexp -> [B, n_filters]
         return self.fc(pooled).squeeze(-1)           # [B] logits (n_classes=1)
 
+
+class SpecAugment(nn.Module):
+    """Train-time frequency- and time-mask augmentation for Gabor features."""
+
+    def __init__(
+        self,
+        freq_masks: int = 2,
+        time_masks: int = 2,
+        max_freq_fraction: float = 0.2,
+        max_time_fraction: float = 0.15,
+    ):
+        super().__init__()
+        if freq_masks < 0 or time_masks < 0:
+            raise ValueError("mask counts cannot be negative")
+        if not 0.0 <= max_freq_fraction <= 1.0:
+            raise ValueError("max_freq_fraction must be in [0, 1]")
+        if not 0.0 <= max_time_fraction <= 1.0:
+            raise ValueError("max_time_fraction must be in [0, 1]")
+        self.freq_masks = freq_masks
+        self.time_masks = time_masks
+        self.max_freq_fraction = max_freq_fraction
+        self.max_time_fraction = max_time_fraction
+
+    @staticmethod
+    def _axis_mask(batch_size, axis_length, mask_count, max_width, device):
+        """Build all per-example span masks on-device without synchronizing."""
+        if mask_count == 0 or max_width == 0 or axis_length == 0:
+            return torch.zeros(batch_size, axis_length, dtype=torch.bool, device=device)
+
+        widths = torch.randint(
+            0,
+            max_width + 1,
+            (batch_size, mask_count),
+            device=device,
+        )
+        available_starts = axis_length - widths + 1
+        starts = (
+            torch.rand(batch_size, mask_count, device=device) * available_starts
+        ).floor().long()
+        positions = torch.arange(axis_length, device=device)[None, None, :]
+        spans = (positions >= starts[..., None]) & (
+            positions < (starts + widths)[..., None]
+        )
+        return spans.any(dim=1)
+
+    def forward(self, x):
+        if not self.training:
+            return x
+        max_freq_width = int(x.shape[1] * self.max_freq_fraction)
+        max_time_width = int(x.shape[2] * self.max_time_fraction)
+        freq_mask = self._axis_mask(
+            x.shape[0], x.shape[1], self.freq_masks, max_freq_width, x.device
+        )
+        time_mask = self._axis_mask(
+            x.shape[0], x.shape[2], self.time_masks, max_time_width, x.device
+        )
+        return x.masked_fill(freq_mask[:, :, None] | time_mask[:, None, :], 0)
+
+
 class GaborNet(nn.Module):
     """
     Learnable Gabor filterbank front-end + small 2D CNN head for clip-level
@@ -123,9 +182,12 @@ class GaborNet(nn.Module):
         super(GaborNet, self).__init__()
         self.feature_extractor = feature_extractor
         self.head = head
+        self.spec_augment = None
 
     def forward(self, x, lengths=None):            # x: [B, 1, L], lengths: [B] valid samples
         feats = self.feature_extractor(x)          # [B, n_filters, T]
+        if self.training and self.spec_augment is not None:
+            feats = self.spec_augment(feats)
         mask = None
         if lengths is not None:
             out_len = self.feature_extractor.output_lengths(lengths.to(feats.device))

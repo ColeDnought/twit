@@ -21,6 +21,7 @@ class AugmentConfig:
     """Configuration for Tier 1/2 waveform and device-input augmentation."""
 
     enabled: bool = True
+    apply_prob: float = 1.0
     sample_rate: int = 16_000
 
     time_shift_prob: float = 0.5
@@ -47,6 +48,7 @@ class AugmentConfig:
 
     def __post_init__(self) -> None:
         probabilities = (
+            self.apply_prob,
             self.time_shift_prob,
             self.random_crop_prob,
             self.background_mix_prob,
@@ -263,16 +265,22 @@ class AudioAugmenter:
             return xs, labels
 
         positives = [bool(label) for label in labels]
+        selected = [
+            torch.rand(()).item() < self.config.apply_prob for _ in waveforms
+        ]
         xs = [
-            self._time_transform(waveform, is_positive)
-            for waveform, is_positive in zip(xs, positives)
+            self._time_transform(waveform, is_positive) if augment else waveform
+            for waveform, is_positive, augment in zip(xs, positives, selected)
         ]
 
         donor_indices = [index for index, positive in enumerate(positives) if not positive]
         pre_mix = [waveform.clone() for waveform in xs]
         if donor_indices:
             for index, signal in enumerate(xs):
-                if torch.rand(()).item() >= self.config.background_mix_prob:
+                if (
+                    not selected[index]
+                    or torch.rand(()).item() >= self.config.background_mix_prob
+                ):
                     continue
                 choices = [candidate for candidate in donor_indices if candidate != index]
                 if not choices:
@@ -286,13 +294,18 @@ class AudioAugmenter:
                 )
 
         for index, signal in enumerate(xs):
-            if torch.rand(()).item() < self.config.pink_noise_prob:
+            if (
+                selected[index]
+                and torch.rand(()).item() < self.config.pink_noise_prob
+            ):
                 xs[index] = self._mix_at_snr(
                     signal,
                     self._pink_noise_like(signal),
                     self._uniform(self.config.pink_noise_snr_db),
                 )
 
-        xs = self._apply_mic_filter(xs)
-        xs = [self._set_level_and_quantize(waveform) for waveform in xs]
+        selected_indices = [index for index, augment in enumerate(selected) if augment]
+        filtered = self._apply_mic_filter([xs[index] for index in selected_indices])
+        for index, waveform in zip(selected_indices, filtered):
+            xs[index] = self._set_level_and_quantize(waveform)
         return xs, labels

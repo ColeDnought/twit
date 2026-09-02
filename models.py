@@ -60,14 +60,15 @@ class CNNHead(nn.Module):
     still drive the logit, unlike average pooling -- before a linear classifier.
     Returns [B] logits (train with BCEWithLogitsLoss).
     """
-    def __init__(self, channels=(16, 32, 64), n_classes=1):
+    def __init__(self, channels=(16, 32, 64), n_classes=1, activation=nn.ReLU):
         super(CNNHead, self).__init__()
+        self.activation_name = activation.__name__
         blocks, in_ch = [], 1
         for out_ch in channels:
             blocks += [
                 nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
                 nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
+                activation(inplace=True),
                 nn.MaxPool2d(2),                     # halve both freq and time each block
             ]
             in_ch = out_ch
@@ -85,6 +86,86 @@ class CNNHead(nn.Module):
             x = x.masked_fill(~m[:, :, None, :], float("-inf"))                     # broadcast over C, F'
         pooled = x.amax(dim=(2, 3))                  # [B, C] masked global max pool
         return self.fc(pooled).squeeze(-1)           # [B] logits (n_classes=1)
+
+
+class DepthwiseSeparableBlock(nn.Module):
+    """Depthwise spatial filtering followed by pointwise channel mixing."""
+
+    def __init__(self, in_channels, out_channels, activation=nn.ReLU):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=3,
+            padding=1,
+            groups=in_channels,
+            bias=False,
+        )
+        self.depthwise_bn = nn.BatchNorm2d(in_channels)
+        self.depthwise_activation = activation(inplace=True)
+        self.pointwise = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            bias=False,
+        )
+        self.pointwise_bn = nn.BatchNorm2d(out_channels)
+        self.pointwise_activation = activation(inplace=True)
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, x):
+        x = self.depthwise_activation(self.depthwise_bn(self.depthwise(x)))
+        x = self.pointwise_activation(self.pointwise_bn(self.pointwise(x)))
+        return self.pool(x)
+
+
+class DSCNNHead(nn.Module):
+    """
+    ESP32-oriented depthwise-separable CNN over [B, n_filters, T].
+
+    A regular stem learns the first set of features, then depthwise 3x3
+    convolutions learn local time-frequency patterns while pointwise 1x1
+    convolutions mix channels. Channel defaults stay SIMD-friendly and the same
+    three pooling stages/receptive field as CNNHead are retained. Masked global
+    max pooling keeps brief bird calls salient.
+    """
+
+    def __init__(self, channels=(16, 32, 32), n_classes=1, activation=nn.ReLU):
+        super().__init__()
+        if not channels:
+            raise ValueError("channels must contain at least one width")
+        if any(channel <= 0 for channel in channels):
+            raise ValueError("channel widths must be positive")
+        self.activation_name = activation.__name__
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(1, channels[0], kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(channels[0]),
+            activation(inplace=True),
+            nn.MaxPool2d(2),
+        )
+        self.blocks = nn.Sequential(
+            *[
+                DepthwiseSeparableBlock(
+                    in_channels,
+                    out_channels,
+                    activation=activation,
+                )
+                for in_channels, out_channels in zip(channels, channels[1:])
+            ]
+        )
+        self.out_channels = channels[-1]
+        self.fc = nn.Linear(self.out_channels, n_classes)
+
+    def forward(self, x, mask=None):                 # x: [B, n_filters, T]
+        x = torch.log1p(x).unsqueeze(1)              # [B, 1, F, T]
+        x = self.blocks(self.stem(x))                # [B, C, F', T']
+        if mask is not None:
+            m = F.adaptive_max_pool1d(mask.float()[:, None, :], x.shape[-1]) > 0.5
+            x = x.masked_fill(~m[:, :, None, :], float("-inf"))
+        pooled = x.amax(dim=(2, 3))
+        return self.fc(pooled).squeeze(-1)
+
 
 class LinearHead(nn.Module):
     """
@@ -123,6 +204,7 @@ class SpecAugment(nn.Module):
         time_masks: int = 2,
         max_freq_fraction: float = 0.2,
         max_time_fraction: float = 0.15,
+        apply_prob: float = 1.0,
     ):
         super().__init__()
         if freq_masks < 0 or time_masks < 0:
@@ -131,10 +213,13 @@ class SpecAugment(nn.Module):
             raise ValueError("max_freq_fraction must be in [0, 1]")
         if not 0.0 <= max_time_fraction <= 1.0:
             raise ValueError("max_time_fraction must be in [0, 1]")
+        if not 0.0 <= apply_prob <= 1.0:
+            raise ValueError("apply_prob must be in [0, 1]")
         self.freq_masks = freq_masks
         self.time_masks = time_masks
         self.max_freq_fraction = max_freq_fraction
         self.max_time_fraction = max_time_fraction
+        self.apply_prob = apply_prob
 
     @staticmethod
     def _axis_mask(batch_size, axis_length, mask_count, max_width, device):
@@ -169,7 +254,9 @@ class SpecAugment(nn.Module):
         time_mask = self._axis_mask(
             x.shape[0], x.shape[2], self.time_masks, max_time_width, x.device
         )
-        return x.masked_fill(freq_mask[:, :, None] | time_mask[:, None, :], 0)
+        selected = torch.rand(x.shape[0], device=x.device) < self.apply_prob
+        mask = (freq_mask[:, :, None] | time_mask[:, None, :]) & selected[:, None, None]
+        return x.masked_fill(mask, 0)
 
 
 class GaborNet(nn.Module):
@@ -216,6 +303,13 @@ def get_config(model):
     cfg["n_classes"] = int(head.fc.out_features)
     if isinstance(head, CNNHead):
         cfg["channels"] = [m.out_channels for m in head.features if isinstance(m, nn.Conv2d)]
+        cfg["activation"] = head.activation_name
+    elif isinstance(head, DSCNNHead):
+        cfg["channels"] = [
+            head.stem[0].out_channels,
+            *[block.pointwise.out_channels for block in head.blocks],
+        ]
+        cfg["activation"] = head.activation_name
     elif isinstance(head, LinearHead):
         cfg["tau"] = float(head.tau)
     return cfg
@@ -225,8 +319,19 @@ def build_from_config(cfg):
     """Reconstruct an (untrained) GaborNet with the architecture described by `cfg`."""
     gf = GaborFilter(cfg["n_filters"], cfg["kernel_size"], cfg["sample_rate"],
                      stride=cfg["stride"], Q=cfg["Q"])
+    activation = getattr(nn, cfg.get("activation", "ReLU"))
     if cfg["head"] == "CNNHead":
-        head = CNNHead(channels=tuple(cfg["channels"]), n_classes=cfg["n_classes"])
+        head = CNNHead(
+            channels=tuple(cfg["channels"]),
+            n_classes=cfg["n_classes"],
+            activation=activation,
+        )
+    elif cfg["head"] == "DSCNNHead":
+        head = DSCNNHead(
+            channels=tuple(cfg["channels"]),
+            n_classes=cfg["n_classes"],
+            activation=activation,
+        )
     elif cfg["head"] == "LinearHead":
         head = LinearHead(cfg["n_filters"], n_classes=cfg["n_classes"], tau=cfg["tau"])
     else:
@@ -234,13 +339,16 @@ def build_from_config(cfg):
     return GaborNet(gf, head)
 
 
-def save_model(model, path):
-    """Portable checkpoint: architecture config + weights in one file.
+def save_model(model, path, training_args=None):
+    """Portable checkpoint: architecture, weights, and optional training metadata.
 
     Loadable on any machine with only `torch` and this `models.py` -- no need to
     remember hyperparameters or match a pruned architecture by hand.
     """
-    torch.save({"config": get_config(model), "state_dict": model.state_dict()}, path)
+    checkpoint = {"config": get_config(model), "state_dict": model.state_dict()}
+    if training_args is not None:
+        checkpoint["training_args"] = dict(training_args)
+    torch.save(checkpoint, path)
 
 
 def load_model(path, map_location="cpu"):

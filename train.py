@@ -23,6 +23,8 @@ class Trainer:
         optimizer: torch.optim.Optimizer = AdamW,
         lr: float = 1e-2,
         lr_scheduler_kwargs: dict = {"eta_min": 0.0},
+        seed: int | None = None,
+        run_name: str | None = None,
     ):
         self.model = model
         self.device = device
@@ -38,18 +40,24 @@ class Trainer:
 
         # differential LRs: calm the churning center freqs, base LR on the head.
         # No weight decay on center_freq (it's a physical param). Bandwidth is now static-Q (not learned).
+        # A frozen (requires_grad=False) filterbank drops out of the optimizer entirely.
         gabor = self.model.feature_extractor
-        param_groups = [
-            {"params": [gabor.center_freq], "lr": lr * 0.1, "weight_decay": 0.0},
-            {"params": self.model.head.parameters(), "lr": lr},
-        ]
+        self.gabor_trainable = gabor.center_freq.requires_grad
+        param_groups = []
+        if self.gabor_trainable:
+            param_groups.append({"params": [gabor.center_freq], "lr": lr * 0.1, "weight_decay": 0.0})
+        param_groups.append({"params": self.model.head.parameters(), "lr": lr})
         self.optimizer = optimizer(param_groups, lr=lr)
         self.lr_scheduler_kwargs = lr_scheduler_kwargs
         self.lr_sched = None
 
-        head_name = self.model.head.__class__.__name__.lower().replace("head", "")
-        run_id = datetime.now().strftime("%m%d-%H%M%S")
-        run_stem = Path(head_name) / run_id
+        # explicit run_name overrides the default "<head>/<timestamp>" grouping
+        if run_name is not None:
+            run_stem = Path(run_name)
+        else:
+            head_name = self.model.head.__class__.__name__.lower().replace("head", "")
+            run_id = datetime.now().strftime("%m%d-%H%M%S")
+            run_stem = Path(head_name) / run_id
         log_dir = Path("runs") / run_stem
         self.checkpoint_path = Path("checkpoints") / run_stem.with_suffix(".pt")
         self.writer = SummaryWriter(log_dir=log_dir)
@@ -62,8 +70,11 @@ class Trainer:
             "lr": lr,
             "optimizer": self.optimizer.__class__.__name__,
             "pos_weight": float(pos_weight.mean()),
+            "gabor_trainable": self.gabor_trainable,
             **{f"sched_{k}": v for k, v in lr_scheduler_kwargs.items()},
         }
+        if seed is not None:
+            self.train_args["seed"] = seed
         # final/best test metrics, filled in by eval()
         self.last_metrics = {}
         self.best_auc = float("-inf")
@@ -94,10 +105,10 @@ class Trainer:
     def _rebuild_optimizer(self):
         """Rebuild optimizer groups around the live parameters created by pruning."""
         gabor = self.model.feature_extractor
-        param_groups = [
-            {"params": [gabor.center_freq], "lr": self.base_lr * 0.1, "weight_decay": 0.0},
-            {"params": self.model.head.parameters(), "lr": self.base_lr},
-        ]
+        param_groups = []
+        if self.gabor_trainable:
+            param_groups.append({"params": [gabor.center_freq], "lr": self.base_lr * 0.1, "weight_decay": 0.0})
+        param_groups.append({"params": self.model.head.parameters(), "lr": self.base_lr})
         self.optimizer = self.optimizer_cls(param_groups, lr=self.base_lr)
         self.lr_sched = None
 
@@ -180,8 +191,9 @@ class Trainer:
         scores, targets = torch.cat(all_scores), torch.cat(all_targets)
         self.writer.add_scalar("ROC_AUC/train", roc_auc_score(targets.numpy(), scores.numpy()), self.epoch)
 
-        self.writer.add_scalar("LR/gabor", self.optimizer.param_groups[0]["lr"], self.epoch)
-        self.writer.add_scalar("LR/head", self.optimizer.param_groups[1]["lr"], self.epoch)
+        if self.gabor_trainable:
+            self.writer.add_scalar("LR/gabor", self.optimizer.param_groups[0]["lr"], self.epoch)
+        self.writer.add_scalar("LR/head", self.optimizer.param_groups[-1]["lr"], self.epoch)
         self.lr_sched.step()
 
     @torch.no_grad()
@@ -257,6 +269,8 @@ class Trainer:
 
     def log_gabor_metrics(self):
         """Diagnose whether the Gabor filters are adapting or just thrashing."""
+        if not self.gabor_trainable:
+            return  # frozen filterbank never moves; these diagnostics are meaningless
         gf = self.model.feature_extractor
         # grads persist from the last train batch (not zeroed after step): an "are they moving?" probe
         cf_grad = gf.center_freq.grad
@@ -324,5 +338,5 @@ class Trainer:
     def save_model(self, path: str | Path | None = None):
         path = Path(path) if path is not None else self.checkpoint_path
         path.parent.mkdir(parents=True, exist_ok=True)
-        save_model(self.model, path)
+        save_model(self.model, path, training_args=self.train_args)
         return path

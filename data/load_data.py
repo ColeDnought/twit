@@ -8,6 +8,7 @@ from typing import Callable, Protocol, Sequence
 from urllib.request import urlopen
 
 import os
+import numpy as np
 import torch
 from scipy.io import wavfile
 from scipy.signal import resample_poly
@@ -47,6 +48,70 @@ def _download_metadata(url: str, destination: Path) -> None:
         temporary.replace(destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _find_metadata(root_dir: str | Path, dataset_name: str) -> Path | None:
+    """Locate a dataset's metadata.csv, preferring the raw layout then any rate cache.
+
+    Labels are sample-rate independent, so a metadata.csv copied into any
+    data/.cache/srN/<dataset>/ is just as valid as the raw one.
+    """
+    root = Path(root_dir)
+    candidates = [root / dataset_name / "metadata.csv"]
+    cache = root / ".cache"
+    if cache.is_dir():
+        candidates += sorted(cache.glob(f"sr*/{dataset_name}/metadata.csv"))
+    return next((path for path in candidates if path.exists()), None)
+
+
+def list_items(root_dir: str | Path = "data") -> list[tuple[str, bool]]:
+    """(itemid, label) for every clip in TwitDataset index order.
+
+    Reproduces the exact DATASET_DIRS x CSV-row ordering that TwitDataset builds,
+    so a seeded random_split over range(len(items)) partitions the same clips the
+    training notebook does -- letting the distillation probe stay leak-free.
+    """
+    items: list[tuple[str, bool]] = []
+    for dataset_name in DATASET_DIRS:
+        metadata = _find_metadata(root_dir, dataset_name)
+        if metadata is None:
+            raise FileNotFoundError(
+                f"no metadata.csv found for {dataset_name} under {root_dir}"
+            )
+        with open(metadata, "r") as f:
+            for row in DictReader(f):
+                items.append((row["itemid"], bool(int(row["hasbird"]))))
+    return items
+
+
+def aggregate_labels(
+    root_dir: str | Path = "data",
+    cache_path: str | Path | None = None,
+    rebuild: bool = False,
+) -> dict[str, int]:
+    """Merge the per-dataset metadata.csv files into one cached {itemid: label} table.
+
+    This single file is the shared source of truth for the distillation tooling
+    (distill/build_targets.py) so labels/itemid keys stay consistent without
+    re-parsing every dataset CSV on each run. Built once, then reused.
+    """
+    root = Path(root_dir)
+    cache_path = Path(cache_path) if cache_path is not None else root / ".cache" / "labels.npz"
+    if cache_path.exists() and not rebuild:
+        return load_labels(cache_path)
+
+    items = list_items(root)
+    itemids = np.array([itemid for itemid, _ in items])
+    labels = np.array([int(label) for _, label in items], dtype=np.int64)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(cache_path, itemids=itemids, labels=labels)
+    return dict(zip(itemids.tolist(), labels.tolist()))
+
+
+def load_labels(cache_path: str | Path = "data/.cache/labels.npz") -> dict[str, int]:
+    """Read the aggregated {itemid: label} table written by aggregate_labels."""
+    data = np.load(cache_path, allow_pickle=False)
+    return dict(zip(data["itemids"].tolist(), data["labels"].tolist()))
 
 
 class TwitDataset(torch.utils.data.Dataset):
@@ -122,12 +187,20 @@ class WaveformAugmenter(Protocol):
 def _pad_and_stack(
     xs: Sequence[torch.Tensor],
     ys: Sequence[bool | int | float],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pad normalized variable-length waveforms and retain their valid lengths."""
+    ts: Sequence[float] | None = None,
+):
+    """Pad normalized variable-length waveforms and retain their valid lengths.
+
+    When per-clip teacher targets `ts` are supplied (distillation path), they are
+    stacked and appended, so the batch becomes (x, y, lengths, targets).
+    """
     lengths = torch.tensor([x.shape[-1] for x in xs])
     x = torch.nn.utils.rnn.pad_sequence(xs, batch_first=True)
     y = torch.tensor(ys, dtype=torch.float32)
-    return x.unsqueeze(1), y, lengths
+    if ts is None:
+        return x.unsqueeze(1), y, lengths
+    t = torch.tensor(ts, dtype=torch.float32)
+    return x.unsqueeze(1), y, lengths, t
 
 
 def collate_fn(batch):
@@ -138,10 +211,14 @@ def collate_fn(batch):
 
 
 def _augmenting_collate(batch, augmenter: WaveformAugmenter):
-    xs, ys = zip(*batch)
+    # DistillDataset yields (waveform, label, teacher_logit); plain sets yield (waveform, label).
+    if len(batch[0]) == 3:
+        xs, ys, ts = zip(*batch)
+    else:
+        xs, ys, ts = *zip(*batch), None
     xs = [x.float() / 32768.0 for x in xs]
     xs, ys = augmenter(xs, ys)
-    return _pad_and_stack(xs, ys)
+    return _pad_and_stack(xs, ys, ts)
 
 
 def make_augmenting_collate(augmenter: WaveformAugmenter) -> Callable:
@@ -159,3 +236,38 @@ def get_class_imbalance(dataset: torch.utils.data.Dataset) -> torch.Tensor:
     n_pos = sum(ys)
     n_neg = len(ys) - n_pos
     return torch.tensor(n_neg / n_pos)
+
+
+def dataset_itemid(dataset: torch.utils.data.Dataset, idx: int) -> str:
+    """itemid (wav stem) for position `idx`, transparently unwrapping Subsets."""
+    while isinstance(dataset, Subset):
+        idx = dataset.indices[idx]
+        dataset = dataset.dataset
+    return dataset.labels[idx][0].stem
+
+
+class DistillDataset(torch.utils.data.Dataset):
+    """Attach a per-clip teacher logit (looked up by itemid) to a (waveform, label) set.
+
+    Wrap the train split only: __getitem__ returns (waveform, label, teacher_logit).
+    `targets` may be a path to a build_targets.py npz (loaded here) or a preloaded
+    {itemid: logit} dict. Clips absent from the table yield NaN so the Trainer drops
+    them from the KD term while still using their hard label. The underlying dataset
+    is untouched, so the eval split keeps using the plain collate_fn.
+    """
+
+    def __init__(self, base: torch.utils.data.Dataset, targets: str | Path | dict[str, float]):
+        self.base = base
+        if isinstance(targets, (str, Path)):
+            data = np.load(targets, allow_pickle=False)
+            targets = dict(zip(data["itemids"].tolist(), data["logits"].tolist()))
+        self.targets = targets
+
+    def __len__(self) -> int:
+        return len(self.base)
+
+    def __getitem__(self, idx: int):
+        waveform, label = self.base[idx]
+        itemid = dataset_itemid(self.base, idx)
+        logit = self.targets.get(itemid, float("nan"))
+        return waveform, label, float(logit)

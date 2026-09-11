@@ -129,11 +129,27 @@ def _build_one(spec: DatasetSpec, data_dir: Path, *, force: bool) -> None:
     print(f"{spec.key}: {n_wavs} wavs + {labels_path.name} in {dataset_dir}")
 
 
-def build_dataset(data_dir: Path, dataset_keys: list[str] | None = None, *, force: bool = False) -> None:
-    data_dir = data_dir.resolve()
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent
+
+
+def build_dataset(
+    data_dir: str | Path | None = None,
+    dataset_keys: list[str] | None = None,
+    *,
+    force: bool = False,
+) -> None:
+    """Download the DCASE dev set(s) into `data_dir` (defaults to this package's dir).
+
+    Callable inline from a notebook, e.g. `build_dataset()` for all three sets or
+    `build_dataset(dataset_keys=["freefield1010"])` for one. Idempotent: existing
+    wavs/labels are skipped unless `force=True`. `dataset_keys` accepts "all".
+    """
+    data_dir = (Path(data_dir) if data_dir is not None else DEFAULT_DATA_DIR).resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
 
     keys = dataset_keys or list(DATASETS)
+    if "all" in keys:
+        keys = list(DATASETS)
     unknown = set(keys) - set(DATASETS)
     if unknown:
         raise ValueError(f"Unknown dataset(s): {sorted(unknown)}. Choose from {list(DATASETS)}")
@@ -147,7 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=Path(__file__).resolve().parent,
+        default=DEFAULT_DATA_DIR,
         help="Directory to hold one subfolder per dataset (default: this script's directory)",
     )
     parser.add_argument(

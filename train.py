@@ -1,10 +1,11 @@
 from datetime import datetime
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 import torch_pruning as tp
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm.notebook import trange, tqdm
 from torch.utils.tensorboard import SummaryWriter
 from sklearn.metrics import roc_auc_score
@@ -25,6 +26,10 @@ class Trainer:
         lr_scheduler_kwargs: dict = {"eta_min": 0.0},
         seed: int | None = None,
         run_name: str | None = None,
+        distill_alpha: float = 1.0,
+        distill_temp: float = 2.0,
+        warmup_epochs: int = 0,
+        warmup_start_factor: float = 0.1,
     ):
         self.model = model
         self.device = device
@@ -32,6 +37,16 @@ class Trainer:
         self.base_lr = lr
         self.pruner = None
         self.regularize_on = False
+
+        # knowledge distillation: loss = alpha*BCE(hard) + (1-alpha)*KD(soft teacher).
+        # alpha=1.0 disables KD entirely, so non-distill runs are unchanged.
+        self.distill_alpha = distill_alpha
+        self.distill_temp = distill_temp
+
+        # linear LR warmup (0 disables): ramp from warmup_start_factor*lr to lr over
+        # warmup_epochs, then hand off to cosine. Applied only to the plain train() path.
+        self.warmup_epochs = warmup_epochs
+        self.warmup_start_factor = warmup_start_factor
         
         self.train_dataloader = train_dataloader
         self.test_dataloader = test_dataloader
@@ -71,6 +86,9 @@ class Trainer:
             "optimizer": self.optimizer.__class__.__name__,
             "pos_weight": float(pos_weight.mean()),
             "gabor_trainable": self.gabor_trainable,
+            "distill_alpha": distill_alpha,
+            "distill_temp": distill_temp,
+            "warmup_epochs": warmup_epochs,
             **{f"sched_{k}": v for k, v in lr_scheduler_kwargs.items()},
         }
         if seed is not None:
@@ -169,24 +187,64 @@ class Trainer:
         # HParams tab: (config -> results) row, run_name="." keeps it in THIS run
         self.writer.add_hparams(hparams, metrics, run_name=".")
 
+    def _distill_loss(self, out, y, teacher_logits):
+        """Blend hard BCE with temperature-scaled KD; returns (loss, bce_val, kd_val).
+
+        KD uses soft targets sigmoid(teacher/T) against the student logits at the
+        same temperature, scaled by T^2 to keep gradient magnitudes comparable to
+        the hard term. Clips with no teacher target (NaN) drop out of the KD mean.
+        """
+        bce = self.criterion(out, y)
+        if teacher_logits is None or self.distill_alpha >= 1.0:
+            return bce, bce.item(), 0.0
+
+        # Sanitize missing targets to 0 BEFORE the graph: masking NaNs only after
+        # they enter the loss still poisons backward (0 * NaN = NaN gradient).
+        valid = ~torch.isnan(teacher_logits)
+        if not valid.any():
+            return bce, bce.item(), 0.0
+        safe_logits = torch.where(valid, teacher_logits, torch.zeros_like(teacher_logits))
+
+        T = self.distill_temp
+        soft_target = torch.sigmoid(safe_logits / T)
+        kd_per = F.binary_cross_entropy_with_logits(out / T, soft_target, reduction="none")
+        kd = (kd_per * valid).sum() / valid.sum() * (T ** 2)  # zero-weight missing clips
+        loss = self.distill_alpha * bce + (1 - self.distill_alpha) * kd
+        return loss, bce.item(), float(kd.item())
+
     def train_epoch(self):
         self.model.train()
-        total_loss, all_scores, all_targets = 0.0, [], []
-        for x, y, lengths in tqdm(self.train_dataloader, leave=False):
+        total_loss = total_bce = total_kd = 0.0
+        all_scores, all_targets = [], []
+        distilling = False
+        for batch in tqdm(self.train_dataloader, leave=False):
+            # DistillDataset batches carry a 4th element: per-clip teacher logits
+            if len(batch) == 4:
+                x, y, lengths, teacher_logits = batch
+                teacher_logits = teacher_logits.to(self.device)
+                distilling = True
+            else:
+                x, y, lengths = batch
+                teacher_logits = None
             x, y = x.to(self.device), y.to(self.device)
             out = self.model(x, lengths)
-            loss = self.criterion(out, y)
+            loss, bce_val, kd_val = self._distill_loss(out, y, teacher_logits)
             self.optimizer.zero_grad()
             loss.backward()
             if self.pruner is not None and self.regularize_on:
                 self.pruner.regularize(self.model)
             self.optimizer.step()
             total_loss += loss.item()
+            total_bce += bce_val
+            total_kd += kd_val
             all_scores.append(out.detach().cpu())
             all_targets.append(y.detach().cpu())
 
-        avg_loss = total_loss / len(self.train_dataloader)
-        self.writer.add_scalar("Loss/train", avg_loss, self.epoch)
+        n_batches = len(self.train_dataloader)
+        self.writer.add_scalar("Loss/train", total_loss / n_batches, self.epoch)
+        if distilling:
+            self.writer.add_scalar("Loss/train_bce", total_bce / n_batches, self.epoch)
+            self.writer.add_scalar("Loss/train_kd", total_kd / n_batches, self.epoch)
 
         scores, targets = torch.cat(all_scores), torch.cat(all_targets)
         self.writer.add_scalar("ROC_AUC/train", roc_auc_score(targets.numpy(), scores.numpy()), self.epoch)
@@ -291,9 +349,23 @@ class Trainer:
         self.writer.add_histogram("Gabor/cf_hz", cf, self.epoch)
         self.cf_prev = cf
 
-    def _run_phase(self, epochs):
-        """Run one training phase with a fresh cosine schedule."""
-        self.lr_sched = CosineAnnealingLR(self.optimizer, T_max=epochs, **self.lr_scheduler_kwargs)
+    def _run_phase(self, epochs, warmup_epochs=0):
+        """Run one training phase: optional linear warmup, then a fresh cosine decay."""
+        warmup_epochs = min(max(warmup_epochs, 0), max(epochs - 1, 0))
+        cosine = CosineAnnealingLR(
+            self.optimizer, T_max=epochs - warmup_epochs, **self.lr_scheduler_kwargs
+        )
+        if warmup_epochs > 0:
+            warmup = LinearLR(
+                self.optimizer,
+                start_factor=self.warmup_start_factor,
+                total_iters=warmup_epochs,
+            )
+            self.lr_sched = SequentialLR(
+                self.optimizer, schedulers=[warmup, cosine], milestones=[warmup_epochs]
+            )
+        else:
+            self.lr_sched = cosine
         for _ in trange(epochs, colour="green"):
             self.train_epoch()
             self.eval(self.test_dataloader)
@@ -302,9 +374,10 @@ class Trainer:
             self.epoch += 1
 
     def train(self, epochs):
-        # smooth cosine decay over the whole run (both LR groups share this scheduler)
+        # linear warmup (if set) then smooth cosine decay over the rest of the run;
+        # both LR groups share this scheduler, preserving their differential base LRs.
         self.train_args["sched_T_max"] = epochs
-        self._run_phase(epochs)
+        self._run_phase(epochs, warmup_epochs=self.warmup_epochs)
         self.log_model_info()
         self.save_model()
 
